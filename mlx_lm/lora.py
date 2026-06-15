@@ -79,6 +79,8 @@ CONFIG_DEFAULTS = {
     "grad_checkpoint": False,
     "gated_grad_checkpoint": False,
     "chunked_loss_size": 0,
+    "analytic_gated_delta_steps": 0,
+    "chunked_attention_q": 0,
     "grad_accumulation_steps": 1,
     "clear_cache_threshold": 0,
     "lr_schedule": None,
@@ -219,6 +221,22 @@ def build_parser():
         default=None,
     )
     parser.add_argument(
+        "--analytic-gated-delta-steps",
+        type=int,
+        help="If > 0, run gated-delta layers with a chunked scan and analytic "
+        "backward in chunks of this many steps to cut long-context memory "
+        "(gradients match the reference scan).",
+        default=None,
+    )
+    parser.add_argument(
+        "--chunked-attention-q",
+        type=int,
+        help="If > 0, compute full-attention backward per query-chunk of this many "
+        "tokens (flash-backward), holding ~one chunk of scores instead of the full "
+        "L x L tensor. Long, full-sequence causal training only.",
+        default=None,
+    )
+    parser.add_argument(
         "--clear-cache-threshold",
         type=_parse_size,
         default=0,
@@ -303,6 +321,8 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         gated_grad_checkpoint=args.gated_grad_checkpoint,
+        analytic_gated_delta_steps=args.analytic_gated_delta_steps,
+        chunked_attention_q=args.chunked_attention_q,
         grad_accumulation_steps=args.grad_accumulation_steps,
     )
 

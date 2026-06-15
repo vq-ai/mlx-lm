@@ -134,6 +134,24 @@ class TrainingArgs:
             "are unchanged."
         },
     )
+    analytic_gated_delta_steps: int = field(
+        default=0,
+        metadata={
+            "help": "If > 0, run the gated-delta linear-attention layers with a "
+            "chunked scan and an analytic (taped) backward in chunks of this many "
+            "steps, instead of materializing the full per-step state graph. Lowers "
+            "peak memory at long context; gradients match the reference scan."
+        },
+    )
+    chunked_attention_q: int = field(
+        default=0,
+        metadata={
+            "help": "If > 0, compute the full-attention layers' backward per "
+            "query-chunk of this many tokens (flash-backward), holding ~one chunk "
+            "of scores instead of the full L x L tensor. Long, full-sequence "
+            "causal training only; default path is unchanged."
+        },
+    )
     grad_accumulation_steps: int = field(
         default=1,
         metadata={
@@ -371,6 +389,17 @@ def train(
     if args.grad_checkpoint:
         ckpt = gated_grad_checkpoint if args.gated_grad_checkpoint else grad_checkpoint
         ckpt(model.layers[0])
+
+    # Opt-in long-context memory paths. Both default off (steps/q == 0), so the
+    # model runs its stock forward/backward unless explicitly requested here.
+    if args.analytic_gated_delta_steps:
+        from ..models.gated_delta import set_analytic_gated_delta
+
+        set_analytic_gated_delta(args.analytic_gated_delta_steps)
+    if args.chunked_attention_q:
+        from ..models.base import set_chunked_attention
+
+        set_chunked_attention(args.chunked_attention_q)
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
