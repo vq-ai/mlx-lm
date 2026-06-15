@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from ..cli_ui import TrainUI, rprint
 from .callbacks import TrainingCallback
@@ -34,6 +34,63 @@ def grad_checkpoint(layer):
             return fn(model, *args, **kwargs)
 
         return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
+
+
+def gated_grad_checkpoint(layer):
+    """
+    Gradient checkpointing that serializes each layer's recompute with the
+    backward pass, lowering peak memory at long context.
+
+    Stock ``grad_checkpoint`` uses ``mx.checkpoint``, whose recompute subgraphs
+    depend only on saved inputs, so during the backward pass many layers'
+    recomputed activations can be scheduled before any are consumed. At long
+    context that concurrency dominates the peak. This variant registers a custom
+    VJP whose recompute primals carry an explicit ``mx.depends`` edge on the
+    incoming cotangents: layer ``i``'s recompute is unschedulable until layer
+    ``i+1``'s backward has produced them, so the peak holds roughly one layer's
+    recompute. The computed gradients are identical to plain checkpointing.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        flat_params = tree_flatten(model.trainable_parameters())
+        names = [k for k, _ in flat_params]
+        n_params = len(flat_params)
+        # Non-array args (mask strings, caches) ride the closure; array args go
+        # through the op so they receive gradients and the gating edge.
+        arr_idx = [i for i, a in enumerate(args) if isinstance(a, mx.array)]
+
+        def run(arrays):
+            params = tree_unflatten(list(zip(names, arrays[:n_params])))
+            model.update(params)
+            call_args = list(args)
+            for j, i in enumerate(arr_idx):
+                call_args[i] = arrays[n_params + j]
+            return fn(model, *call_args, **kwargs)
+
+        @mx.custom_function
+        def op(*arrays):
+            return run(arrays)
+
+        @op.vjp
+        def op_vjp(primals, cotangents, outputs):
+            cots = (
+                list(cotangents)
+                if isinstance(cotangents, (list, tuple))
+                else [cotangents]
+            )
+            gated = mx.depends(list(primals), cots)
+
+            def rebuilt(*arrays):
+                out = run(arrays)
+                return list(out) if isinstance(out, (list, tuple)) else [out]
+
+            _, vjps = mx.vjp(rebuilt, list(gated), cots)
+            return vjps
+
+        return op(*(v for _, v in flat_params), *(args[i] for i in arr_idx))
 
     type(layer).__call__ = checkpointed_fn
 
@@ -69,6 +126,14 @@ class TrainingArgs:
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
     )
+    gated_grad_checkpoint: bool = field(
+        default=False,
+        metadata={
+            "help": "With grad_checkpoint, serialize each layer's recompute with "
+            "the backward pass to lower peak memory at long context. Gradients "
+            "are unchanged."
+        },
+    )
     grad_accumulation_steps: int = field(
         default=1,
         metadata={
@@ -97,6 +162,77 @@ def default_loss(model, batch, lengths):
     ce = ce.astype(mx.float32).sum() / ntoks
 
     return ce, ntoks
+
+
+def _split_backbone_head(model):
+    """Split an mlx-lm causal LM into ``(backbone, head_fn, head_module)``.
+
+    ``head_fn(h) -> logits``; ``head_module`` owns the head weights (``lm_head``,
+    or ``embed_tokens`` when tied). Handles both the nested
+    (``Model.language_model.{model, lm_head}``) and flat layouts.
+    """
+    inner = getattr(model, "language_model", model)
+    backbone = inner.model
+    if getattr(inner.args, "tie_word_embeddings", False):
+        embed = backbone.embed_tokens
+        return backbone, (lambda h: embed.as_linear(h)), embed
+    return backbone, inner.lm_head, inner.lm_head
+
+
+def masked_chunked_loss(chunk_size=512):
+    """Build a drop-in ``loss(model, batch, lengths)`` that applies the LM head
+    and cross-entropy only on the unmasked span, in chunks under ``mx.checkpoint``.
+
+    ``default_loss`` materializes fp32 logits for every position (``B x L x V``);
+    for a large vocabulary that term dominates peak memory at long context. This
+    runs the backbone to hidden states (``B x L x D``), restricts the head to the
+    tight span of positions that can carry loss (with ``--mask-prompt`` that is
+    just the response tail), and applies head + CE per chunk under
+    ``mx.checkpoint`` so per-chunk logits are recomputed in the backward pass
+    instead of retained. Peak logits memory becomes ``B x min(chunk_size, span) x V``.
+
+    Summing per-chunk CE then dividing by the token count is the stock loss
+    reassociated; gradients agree to floating-point tolerance. Head parameters are
+    threaded explicitly through ``mx.checkpoint`` (closure-captured arrays receive
+    no gradient), so it stays correct for a trainable or tied head; with a frozen
+    (QLoRA) head the parameter tree is empty and there is no overhead. Run with
+    compilation disabled — the span is data-dependent.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    def loss(model, batch, lengths):
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+        backbone, head, head_module = _split_backbone_head(model)
+        h = backbone(inputs)
+
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+
+        # Tight span of positions that can carry loss (host-side ints; lengths is
+        # tiny and this loss runs uncompiled, so .item() is fine).
+        lo = max(int(mx.min(lengths[:, 0]).item()) - 1, 0)  # step s -> index s-1
+        hi = min(int(mx.max(lengths[:, 1]).item()), targets.shape[1])
+
+        def chunk_ce(params, h_c, t_c, m_c):
+            head_module.update(params)
+            ce = nn.losses.cross_entropy(head(h_c), t_c) * m_c
+            return ce.astype(mx.float32).sum()
+
+        total = mx.zeros((), dtype=mx.float32)
+        for s in range(lo, hi, chunk_size):
+            e = min(s + chunk_size, hi)
+            total = total + mx.checkpoint(chunk_ce)(
+                head_module.trainable_parameters(),
+                h[:, s:e],
+                targets[:, s:e],
+                mask[:, s:e],
+            )
+        ntoks = mask.sum()
+        return total / ntoks, ntoks
+
+    return loss
 
 
 def iterate_batches(
@@ -233,7 +369,8 @@ def train(
     rank = world.rank()
 
     if args.grad_checkpoint:
-        grad_checkpoint(model.layers[0])
+        ckpt = gated_grad_checkpoint if args.gated_grad_checkpoint else grad_checkpoint
+        ckpt(model.layers[0])
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 

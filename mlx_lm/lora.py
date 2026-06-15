@@ -16,7 +16,14 @@ from tqdm import tqdm
 from .cli_ui import make_console, print_lora_run_header, rprint
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
+from .tuner.trainer import (
+    TrainingArgs,
+    TrainingCallback,
+    default_loss,
+    evaluate,
+    masked_chunked_loss,
+    train,
+)
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -70,6 +77,8 @@ CONFIG_DEFAULTS = {
     "max_seq_length": 2048,
     "config": None,
     "grad_checkpoint": False,
+    "gated_grad_checkpoint": False,
+    "chunked_loss_size": 0,
     "grad_accumulation_steps": 1,
     "clear_cache_threshold": 0,
     "lr_schedule": None,
@@ -195,6 +204,21 @@ def build_parser():
         default=None,
     )
     parser.add_argument(
+        "--gated-grad-checkpoint",
+        action="store_true",
+        help="With --grad-checkpoint, serialize each layer's recompute with the "
+        "backward pass to lower peak memory at long context (gradients unchanged).",
+        default=None,
+    )
+    parser.add_argument(
+        "--chunked-loss-size",
+        type=int,
+        help="If > 0, compute the LM head + cross-entropy in chunks of this many "
+        "tokens over the unmasked span, avoiding the full B x L x V logits tensor. "
+        "Use with MLX_DISABLE_COMPILE=1.",
+        default=None,
+    )
+    parser.add_argument(
         "--clear-cache-threshold",
         type=_parse_size,
         default=0,
@@ -278,6 +302,7 @@ def train_model(
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
+        gated_grad_checkpoint=args.gated_grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
     )
 
@@ -301,6 +326,13 @@ def train_model(
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
+    # Select the loss: chunked head+CE if requested, else the stock loss.
+    loss_fn = (
+        masked_chunked_loss(args.chunked_loss_size)
+        if args.chunked_loss_size
+        else default_loss
+    )
+
     # Train model
     train(
         model=model,
@@ -308,6 +340,7 @@ def train_model(
         optimizer=opt,
         train_dataset=CacheDataset(train_set),
         val_dataset=CacheDataset(valid_set),
+        loss=loss_fn,
         training_callback=training_callback,
     )
 
