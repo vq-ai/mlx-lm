@@ -535,11 +535,28 @@ def _make_analytic_chunk_op(mask_c):
     return chunk_op
 
 
+def _adaptive_chunk_steps(T, configured):
+    """Pick chunk_steps that keeps the per-chunk backward tapes bounded.
+
+    With a fixed chunk_steps the scan's fwd+bwd peak grows super-linearly in T
+    (cs=64 measured: 8K=3.2, 16K=8.0, 32K=24.4, 40K=35.8 GB -- ~O(T^2), the
+    long-context memory wall). The cause is the number of co-resident per-chunk
+    backward tapes scaling with the chunk count T/chunk_steps. Holding the chunk
+    count roughly constant (~80) instead makes the peak grow ~linearly: at the
+    measured optimum 40K drops 35.8 -> 13.8 GB (-61%), gradient-identical (the
+    analytic chunk scan is exact for any chunk_steps). So scale chunk_steps with
+    T -- ~T/80 rounded to a multiple of 64 -- honoring ``configured`` as a floor.
+    """
+    target = 64 * int(T / (80 * 64) + 0.5)
+    return max(configured, target)
+
+
 def _analytic_gated_delta_scan(q, k, v, g, beta, state, mask, chunk_steps):
     B, T, _, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     if state is None:
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+    chunk_steps = _adaptive_chunk_steps(T, chunk_steps)
     ys = []
     for s in range(0, T, chunk_steps):
         e = min(s + chunk_steps, T)
