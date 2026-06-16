@@ -23,6 +23,7 @@ LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
 - [Fuse](#Fuse)
 - [Data](#Data)
 - [Memory Issues](#Memory-Issues)
+- [Long-Context / Low-Memory Training](#long-context--low-memory-training)
 
 ## Run
 
@@ -408,6 +409,54 @@ The above command on an M1 Max with 32 GB runs at about 250
 tokens-per-second, using the MLX Example
 [`wikisql`](https://github.com/ml-explore/mlx-examples/tree/main/lora/data)
 data set.
+
+## Long-Context / Low-Memory Training
+
+This fork adds opt-in optimizations that sharply cut training memory at long context, so
+you can fine-tune sequences that would otherwise run out of memory. On a 64 GB M3 Max,
+Qwen3.5-4B (4-bit QLoRA) goes from OOM-ing at 2K (stock) to training at **64K** — 32x the
+context on the same machine — with the loss matching stock to floating-point noise.
+
+The simplest way to use them is the `--long-context` preset:
+
+```shell
+mlx_lm.lora \
+    --model <quantized_model> \
+    --train \
+    --data <path_to_data> \
+    --max-seq-length 32768 \
+    --batch-size 1 \
+    --long-context
+```
+
+It is **off by default**; a run without it is byte-identical to stock. `--long-context`
+turns on the optimizations below and disables `mx.compile` (the chunked cross-entropy is
+incompatible with it):
+
+| flag (set by the preset) | what it does |
+|---|---|
+| `--grad-checkpoint` | recompute layer activations in the backward instead of storing them |
+| `--gated-grad-checkpoint` | serialize each layer's recompute with the backward pass, lowering the peak (gradients unchanged) |
+| `--chunked-loss-size 512` | compute the LM head + cross-entropy in 512-token chunks, never materializing the full `B x L x vocab` logits |
+| `--analytic-gated-delta-steps 64` | run the gated-delta (linear-attention) layers with a chunked scan + analytic backward; the chunk size auto-scales with context so memory grows linearly, not quadratically |
+| `--chunked-attention-q 512` | compute the full-attention backward per 512-token query-chunk, holding ~one chunk of scores instead of the full `L x L` |
+
+Pass any of them explicitly to override the preset (e.g. `--long-context --chunked-loss-size 1024`).
+Every flag is gradient-equivalent to stock: they change *how* memory is scheduled, not the
+math. Because the chunked cross-entropy can't run under `mx.compile`, the preset trades a
+little throughput for the memory bound — worth it at long context, not at short.
+
+> [!NOTE]
+> These help at long context (around 8K and up). At short context they cost a little
+> throughput for memory you don't need, so leave `--long-context` off for short-sequence
+> training.
+
+**Optional extra speed.** The full-attention layers can use a fused flash-attention training
+kernel instead of the chunked-attention fallback. That needs the companion MLX fork (which
+adds `head_dim=256` support) plus `MLX_SDPA_TRAIN=1`. With stock MLX, `--long-context` uses
+the chunked-attention path, which is correct and memory-bounded, just a bit slower. The 64K
+figure above was measured with the flash kernel; the stock-MLX path reaches the same context
+at comparable memory.
 
 [^lora]: Refer to the [arXiv paper](https://arxiv.org/abs/2106.09685) for more details on LoRA.
 

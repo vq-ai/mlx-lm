@@ -81,6 +81,7 @@ CONFIG_DEFAULTS = {
     "chunked_loss_size": 0,
     "analytic_gated_delta_steps": 0,
     "chunked_attention_q": 0,
+    "long_context": False,
     "grad_accumulation_steps": 1,
     "clear_cache_threshold": 0,
     "lr_schedule": None,
@@ -234,6 +235,16 @@ def build_parser():
         help="If > 0, compute full-attention backward per query-chunk of this many "
         "tokens (flash-backward), holding ~one chunk of scores instead of the full "
         "L x L tensor. Long, full-sequence causal training only.",
+        default=None,
+    )
+    parser.add_argument(
+        "--long-context",
+        action="store_true",
+        help="One-flag low-memory preset for long-context QLoRA. Enables the memory "
+        "optimizations (--grad-checkpoint, --gated-grad-checkpoint, --chunked-loss-size "
+        "512, --analytic-gated-delta-steps 64, --chunked-attention-q 512) and disables "
+        "mx.compile (which the chunked cross-entropy is incompatible with). Any of those "
+        "flags set explicitly override the preset. Off by default (stock behavior).",
         default=None,
     )
     parser.add_argument(
@@ -441,6 +452,23 @@ def main():
     for k, v in CONFIG_DEFAULTS.items():
         if args.get(k, None) is None:
             args[k] = v
+
+    # --long-context: one-flag preset. Turn on the long-context memory
+    # optimizations (unless the user set one explicitly) and disable mx.compile,
+    # which the chunked cross-entropy is incompatible with. Stays off by default,
+    # so default runs remain byte-identical to stock.
+    if args.get("long_context"):
+        mx.disable_compile()
+        for k, v in {
+            "grad_checkpoint": True,
+            "gated_grad_checkpoint": True,
+            "chunked_loss_size": 512,
+            "analytic_gated_delta_steps": 64,
+            "chunked_attention_q": 512,
+        }.items():
+            if not args.get(k):
+                args[k] = v
+
     run(types.SimpleNamespace(**args))
 
 
